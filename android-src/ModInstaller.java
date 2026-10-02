@@ -51,4 +51,15 @@ public class ModInstaller {
             return "ERR: " + t.getMessage();
         }
     }
+    /** Возвращает список файлов в папке Files (через Shizuku). */
+public static String listFiles() {
+    if (!Shizuku.pingBinder()) return null;
+    try {
+        String out = sh("ls -1 '" + SOURCE + "'");
+        if (out == null || out.startsWith("ERR")) return null;
+        return out;
+    } catch (Throwable t) {
+        return null;
+    }
+}
 }

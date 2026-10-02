@@ -39,12 +39,26 @@ jobs:
           python3 - <<'PY'
           p='android/app/src/main/java/com/venceti/mods/ModInstaller.java'
           s=open(p,encoding='utf-8').read()
-          old='Process p = Shizuku.newProcess(new String[]{"sh", "-c", cmd}, null, null);'
-          new=('java.lang.reflect.Method m = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);\n'
-               '            m.setAccessible(true);\n'
-               '            Process p = (Process) m.invoke(null, new String[]{"sh", "-c", cmd}, null, null);')
-          if old in s:
-              s=s.replace(old,new)
+          helper='''
+              private static Process shizukuProcess(String[] cmd, String[] env, String dir) throws android.os.RemoteException {
+                  try {
+                      java.lang.reflect.Method m = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);
+                      m.setAccessible(true);
+                      return (Process) m.invoke(null, cmd, env, dir);
+                  } catch (java.lang.reflect.InvocationTargetException e) {
+                      Throwable c = e.getCause();
+                      if (c instanceof android.os.RemoteException) throw (android.os.RemoteException) c;
+                      throw new RuntimeException(c);
+                  } catch (Exception e) {
+                      throw new RuntimeException(e);
+                  }
+              }
+          }
+          '''
+          if 'Shizuku.newProcess(' in s:
+              s=s.replace('Shizuku.newProcess(','shizukuProcess(')
+              i=s.rfind('}')
+              s=s[:i]+helper
               open(p,'w',encoding='utf-8').write(s)
               print("patched")
           else:
@@ -84,7 +98,7 @@ jobs:
         run: |
           sed -i -E 's/minSdkVersion *= *[0-9]+/minSdkVersion = 24/' android/variables.gradle
           grep -n minSdk android/variables.gradle
-          
+
       - name: Add Shizuku dependency
         run: |
           GRADLE=android/app/build.gradle

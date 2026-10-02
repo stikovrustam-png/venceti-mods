@@ -80,11 +80,11 @@ jobs:
           PY
           cat android/app/src/main/AndroidManifest.xml
 
-      - name: Force minSdk 23
+      - name: Force minSdk 24
         run: |
-          sed -i -E 's/minSdkVersion *= *[0-9]+/minSdkVersion = 23/' android/variables.gradle
+          sed -i -E 's/minSdkVersion *= *[0-9]+/minSdkVersion = 24/' android/variables.gradle
           grep -n minSdk android/variables.gradle
-
+          
       - name: Add Shizuku dependency
         run: |
           GRADLE=android/app/build.gradle

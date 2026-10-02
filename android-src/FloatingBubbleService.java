@@ -12,9 +12,7 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
-import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -37,37 +35,99 @@ public class FloatingBubbleService extends Service {
 
     private static final String CHANNEL_ID = "venceti_overlay";
     private static final int NOTIF_ID = 4242;
-    private static final String LINK_CREATOR = "https://t.me/babycores";
 
-    private static final int C_BG         = Color.parseColor("#0E0E10");
-    private static final int C_BTN        = Color.parseColor("#16161A");
-    private static final int C_BTN_STROKE = Color.parseColor("#26262E");
-    private static final int C_ACCENT     = Color.parseColor("#2F80FF");
-    private static final int C_TEXT       = Color.parseColor("#DCDCDC");
-    private static final int C_MUTED      = Color.parseColor("#6C6C6C");
+    private static final int C_BG = Color.parseColor("#0E0E10");
+    private static final int C_BTN = Color.parseColor("#16161A");
+    private static final int C_ACCENT = Color.parseColor("#2F80FF");
+    private static final int C_TEXT = Color.parseColor("#DCDCDC");
+    private static final int C_MUTED = Color.parseColor("#6C6C6C");
+    private static final int C_LINE = Color.parseColor("#26262C");
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
 
     private WindowManager wm;
-    private TextView bubble;
+
+    private IconView bubble;
     private WindowManager.LayoutParams bubbleLp;
+    private boolean bubbleAttached = false;
+
     private LinearLayout panel;
     private WindowManager.LayoutParams panelLp;
+    private boolean panelAttached = false;
+    private View downloadBtn;
+    private TextView sourceView;
+
+    private int posX = 0;
+    private int posY = 0;
 
     private String mode = "apk";
     private volatile boolean busy = false;
     private boolean holdTriggered = false;
 
-    private final Runnable holdRunnable = new Runnable() {
-        @Override public void run() { holdTriggered = true; killAll(); }
+    private final Runnable holdRunnable = () -> {
+        holdTriggered = true;
+        killAll();
     };
+
+    // ------------------------------------------------------------ icons
+
+    private static class IconView extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        private final int type; // 0 = download arrow, 1 = V logo, 2 = close X
+
+        IconView(Context c, int type, int color) {
+            super(c);
+            this.type = type;
+            p.setColor(color);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            try {
+                float w = getWidth();
+                float h = getHeight();
+                p.setStrokeWidth(Math.min(w, h) * 0.1f);
+                path.reset();
+                switch (type) {
+                    case 0:
+                        path.moveTo(w * 0.5f, h * 0.16f);
+                        path.lineTo(w * 0.5f, h * 0.64f);
+                        path.moveTo(w * 0.28f, h * 0.44f);
+                        path.lineTo(w * 0.5f, h * 0.66f);
+                        path.lineTo(w * 0.72f, h * 0.44f);
+                        path.moveTo(w * 0.22f, h * 0.84f);
+                        path.lineTo(w * 0.78f, h * 0.84f);
+                        break;
+                    case 1:
+                        path.moveTo(w * 0.27f, h * 0.31f);
+                        path.lineTo(w * 0.5f, h * 0.71f);
+                        path.lineTo(w * 0.73f, h * 0.31f);
+                        break;
+                    default:
+                        path.moveTo(w * 0.28f, h * 0.28f);
+                        path.lineTo(w * 0.72f, h * 0.72f);
+                        path.moveTo(w * 0.72f, h * 0.28f);
+                        path.lineTo(w * 0.28f, h * 0.72f);
+                        break;
+                }
+                c.drawPath(path, p);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    // ------------------------------------------------------------ lifecycle
 
     @Override
     public void onCreate() {
         super.onCreate();
-        try { wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE); }
-        catch (Throwable ignored) { }
+        try {
+            wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        } catch (Throwable ignored) { }
     }
 
     @Override
@@ -78,18 +138,29 @@ public class FloatingBubbleService extends Service {
                 String m = intent.getStringExtra("mode");
                 if (m != null) mode = m;
             }
-            if (!Settings.canDrawOverlays(this)) { killAll(); return START_NOT_STICKY; }
+            if (!Settings.canDrawOverlays(this)) {
+                killAll();
+                return START_NOT_STICKY;
+            }
+            if (wm == null) wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
             if (bubble == null) createBubble();
-        } catch (Throwable t) { killAll(); }
+            if (!bubbleAttached && !panelAttached) showBubble();
+            if (sourceView != null) sourceView.setText("Source: " + srcName());
+        } catch (Throwable t) {
+            killAll();
+        }
         return START_NOT_STICKY;
     }
 
-    @Override public IBinder onBind(Intent intent) { return null; }
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
 
     @Override
     public void onDestroy() {
         try { ui.removeCallbacksAndMessages(null); } catch (Throwable ignored) { }
-        destroyAll();
+        destroyOverlay();
         try { io.shutdownNow(); } catch (Throwable ignored) { }
         super.onDestroy();
     }
@@ -97,8 +168,11 @@ public class FloatingBubbleService extends Service {
     private void startForegroundSafe() {
         try {
             Notification n = buildNotification();
-            if (Build.VERSION.SDK_INT >= 34) startForeground(NOTIF_ID, n, 0x40000000);
-            else startForeground(NOTIF_ID, n);
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, n, 0x40000000); // SPECIAL_USE
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
         } catch (Throwable ignored) { }
     }
 
@@ -106,14 +180,58 @@ public class FloatingBubbleService extends Service {
         Notification.Builder b;
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) nm.createNotificationChannel(new NotificationChannel(
-                    CHANNEL_ID, "Venceti Mods", NotificationManager.IMPORTANCE_LOW));
+            if (nm != null) {
+                nm.createNotificationChannel(new NotificationChannel(
+                        CHANNEL_ID, "Venceti Mods", NotificationManager.IMPORTANCE_LOW));
+            }
             b = new Notification.Builder(this, CHANNEL_ID);
-        } else b = new Notification.Builder(this);
-        b.setContentTitle("Venceti Mods").setContentText("Overlay active")
-         .setSmallIcon(android.R.drawable.ic_menu_manage).setOngoing(true);
+        } else {
+            b = new Notification.Builder(this);
+        }
+        b.setContentTitle("Venceti Mods")
+                .setContentText("Overlay active")
+                .setSmallIcon(android.R.drawable.ic_menu_manage)
+                .setOngoing(true);
         return b.build();
     }
+
+    // ------------------------------------------------------------ teardown (idempotent)
+
+    private void hideBubble() {
+        IconView b = bubble;
+        if (b != null && bubbleAttached && wm != null) {
+            try { wm.removeView(b); } catch (Throwable ignored) { }
+        }
+        bubbleAttached = false;
+    }
+
+    private void removePanelView() {
+        LinearLayout p = panel;
+        if (p != null && panelAttached && wm != null) {
+            try { wm.removeView(p); } catch (Throwable ignored) { }
+        }
+        panelAttached = false;
+        panel = null;
+        panelLp = null;
+        downloadBtn = null;
+        sourceView = null;
+    }
+
+    private void destroyOverlay() {
+        removePanelView();
+        hideBubble();
+        bubble = null;
+        bubbleLp = null;
+    }
+
+    private void killAll() {
+        try { ui.removeCallbacksAndMessages(null); } catch (Throwable ignored) { }
+        destroyOverlay();
+        try { stopForeground(Service.STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) { }
+        try { stopSelf(); } catch (Throwable ignored) { }
+    }
+
+    // ------------------------------------------------------------ window helpers
 
     private int overlayType() {
         return Build.VERSION.SDK_INT >= 26
@@ -121,350 +239,309 @@ public class FloatingBubbleService extends Service {
                 : WindowManager.LayoutParams.TYPE_PHONE;
     }
 
-    // ------------------------------------------------------------- bubble
-
-    private void createBubble() {
-        if (wm == null || bubble != null) return;
-        final int size = dp(56);
-
-        TextView circle = new TextView(this);
-        circle.setText("apk".equals(mode) ? "a" : "g");
-        circle.setTextColor(C_ACCENT);
-        circle.setTextSize(22);
-        circle.setTypeface(Typeface.DEFAULT_BOLD);
-        circle.setGravity(Gravity.CENTER);
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Color.parseColor("#000000"));
-        bg.setStroke(dp(2), C_ACCENT);
-        circle.setBackground(bg);
-
-        DisplayMetrics dm = getResources().getDisplayMetrics();
+    private WindowManager.LayoutParams baseLp(int w, int h) {
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                size, size, overlayType(),
+                w, h, overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = dm.widthPixels - size - dp(12);
-        lp.y = dm.heightPixels / 3;
-
-        circle.setOnTouchListener(new View.OnTouchListener() {
-            private int sx, sy;
-            private float tx, ty;
-            private boolean moved;
-            @Override public boolean onTouch(View v, MotionEvent e) {
-                try {
-                    WindowManager.LayoutParams p = bubbleLp;
-                    if (p == null || wm == null || bubble == null) return false;
-                    switch (e.getActionMasked()) {
-                        case MotionEvent.ACTION_DOWN:
-                            sx = p.x; sy = p.y;
-                            tx = e.getRawX(); ty = e.getRawY();
-                            moved = false;
-                            return true;
-                        case MotionEvent.ACTION_MOVE: {
-                            float dx = e.getRawX() - tx;
-                            float dy = e.getRawY() - ty;
-                            if (!moved && (Math.abs(dx) > dp(8) || Math.abs(dy) > dp(8))) moved = true;
-                            if (moved) {
-                                p.x = (int) (sx + dx);
-                                p.y = (int) (sy + dy);
-                                wm.updateViewLayout(bubble, p);
-                            }
-                            return true;
-                        }
-                        case MotionEvent.ACTION_UP:
-                            if (!moved) openPanel();
-                            return true;
-                    }
-                } catch (Throwable ignored) { }
-                return true;
-            }
-        });
-
-        try { wm.addView(circle, lp); } catch (Throwable t) { return; }
-        bubble = circle;
-        bubbleLp = lp;
+        return lp;
     }
 
-    // ------------------------------------------------------------- panel
+    private int clampX(int x, int w) {
+        int max = getResources().getDisplayMetrics().widthPixels - w;
+        return Math.max(0, Math.min(x, Math.max(0, max)));
+    }
+
+    private int clampY(int y, int h) {
+        int max = getResources().getDisplayMetrics().heightPixels - h;
+        return Math.max(0, Math.min(y, Math.max(0, max)));
+    }
+
+    // ------------------------------------------------------------ drag (bubble and panel header)
+
+    private class Drag implements View.OnTouchListener {
+        private final boolean isPanel;
+        private int sx, sy;
+        private float tx, ty;
+        private boolean moved;
+
+        Drag(boolean isPanel) {
+            this.isPanel = isPanel;
+        }
+
+        @Override
+        public boolean onTouch(View v, MotionEvent e) {
+            try {
+                WindowManager.LayoutParams p = isPanel ? panelLp : bubbleLp;
+                View target = isPanel ? panel : bubble;
+                if (p == null || target == null || wm == null) return true;
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        sx = p.x;
+                        sy = p.y;
+                        tx = e.getRawX();
+                        ty = e.getRawY();
+                        moved = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = e.getRawX() - tx;
+                        float dy = e.getRawY() - ty;
+                        if (!moved && (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6))) moved = true;
+                        if (moved) {
+                            int w = isPanel ? p.width : dp(56);
+                            int h = isPanel ? Math.max(target.getHeight(), dp(100)) : dp(56);
+                            int nx = clampX(Math.round(sx + dx), w);
+                            int ny = clampY(Math.round(sy + dy), h);
+                            if (nx != p.x || ny != p.y) {
+                                p.x = nx;
+                                p.y = ny;
+                                posX = nx;
+                                posY = ny;
+                                wm.updateViewLayout(target, p);
+                            }
+                        }
+                        return true;
+                    }
+                    case MotionEvent.ACTION_UP:
+                        if (!moved && !isPanel) openPanel();
+                        return true;
+                    default:
+                        return true;
+                }
+            } catch (Throwable ignored) { }
+            return true;
+        }
+    }
+
+    // ------------------------------------------------------------ bubble
+
+    private void createBubble() {
+        if (bubble != null) return;
+        int size = dp(56);
+        IconView b = new IconView(this, 1, Color.WHITE);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(C_ACCENT);
+        b.setBackground(bg);
+        b.setOnTouchListener(new Drag(false));
+        bubbleLp = baseLp(size, size);
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        posX = dm.widthPixels - size - dp(12);
+        posY = dm.heightPixels / 3;
+        bubble = b;
+    }
+
+    private void showBubble() {
+        if (wm == null || bubble == null || bubbleLp == null || bubbleAttached) return;
+        try {
+            int s = dp(56);
+            bubbleLp.x = clampX(posX, s);
+            bubbleLp.y = clampY(posY, s);
+            posX = bubbleLp.x;
+            posY = bubbleLp.y;
+            wm.addView(bubble, bubbleLp);
+            bubbleAttached = true;
+        } catch (Throwable ignored) { }
+    }
 
     private void openPanel() {
-        if (wm == null || panel != null || bubble == null || bubbleLp == null) return;
+        try {
+            hideBubble();
+            showPanel();
+        } catch (Throwable t) {
+            showBubble();
+        }
+    }
 
-        // Скрыть кружок
-        try { bubble.setVisibility(View.GONE); } catch (Throwable ignored) { }
+    // ------------------------------------------------------------ panel
 
-        LinearLayout root = new LinearLayout(this);
+    private void showPanel() {
+        if (wm == null || panelAttached) return;
+        final int w = dp(260);
+
+        final LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(12), dp(16), dp(16));
-        root.setBackground(rounded(C_BG, 16, Color.parseColor("#2A2A2A"), 1));
+        root.setBackground(rounded(C_BG, 14, C_LINE, 1));
 
-        // -------- шапка (drag + крестик) --------
+        panelLp = baseLp(w, ViewGroup.LayoutParams.WRAP_CONTENT);
+        panelLp.x = clampX(posX, w);
+        panelLp.y = clampY(posY, dp(150));
+        panel = root;
+        buildPanel(root);
+
+        try {
+            wm.addView(root, panelLp);
+            panelAttached = true;
+        } catch (Throwable t) {
+            panel = null;
+            panelLp = null;
+            downloadBtn = null;
+            sourceView = null;
+            showBubble();
+            return;
+        }
+
+        root.post(() -> {
+            try {
+                if (panel != root || panelLp == null || wm == null) return;
+                int nx = clampX(panelLp.x, panelLp.width);
+                int ny = clampY(panelLp.y, root.getHeight());
+                if (nx != panelLp.x || ny != panelLp.y) {
+                    panelLp.x = nx;
+                    panelLp.y = ny;
+                    wm.updateViewLayout(root, panelLp);
+                }
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    private void buildPanel(LinearLayout root) {
+        // header = whole top strip is the drag handle
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(12), dp(4), dp(4), dp(4));
+        GradientDrawable hb = new GradientDrawable();
+        hb.setColor(C_BTN);
+        float r = dp(14);
+        hb.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
+        header.setBackground(hb);
 
-        TextView title = text((mode.equals("apk") ? "a" : "g") + "  Mods Panel", 15, C_TEXT, true);
-        header.addView(title, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(new IconView(this, 1, C_ACCENT), new LinearLayout.LayoutParams(dp(22), dp(22)));
 
-        TextView close = new TextView(this);
-        close.setText("✕");
-        close.setTextColor(Color.parseColor("#9A9A9A"));
-        close.setTextSize(18);
-        close.setPadding(dp(10), dp(4), dp(4), dp(4));
-        attachCloseHandler(close);
-        header.addView(close, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView title = text("Mods Panel", 15, C_TEXT, true);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tlp.leftMargin = dp(8);
+        header.addView(title, tlp);
 
+        IconView close = new IconView(this, 2, C_TEXT);
+        header.addView(close, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        attachClose(close);
+
+        header.setOnTouchListener(new Drag(true));
         root.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // -------- источник --------
-        TextView sub = text("Source: " + (mode.equals("apk") ? "APK" : "Google Play"), 11, C_MUTED, false);
-        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+        // body
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(12), dp(10), dp(12), dp(12));
+
+        sourceView = text("Source: " + srcName(), 13, C_MUTED, false);
+        body.addView(sourceView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout btn = new LinearLayout(this);
+        btn.setOrientation(LinearLayout.HORIZONTAL);
+        btn.setGravity(Gravity.CENTER);
+        btn.setPadding(dp(12), dp(12), dp(12), dp(12));
+        btn.setBackground(rounded(C_ACCENT, 10, 0, 0));
+        btn.setClickable(true);
+        btn.addView(new IconView(this, 0, Color.WHITE), new LinearLayout.LayoutParams(dp(20), dp(20)));
+        TextView bt = text("Download", 15, Color.WHITE, true);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.leftMargin = dp(8);
+        btn.addView(bt, blp);
+        btn.setOnClickListener(v -> onDownload());
+        downloadBtn = btn;
+
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        subLp.topMargin = dp(2);
-        subLp.bottomMargin = dp(12);
-        root.addView(sub, subLp);
+        dlp.topMargin = dp(10);
+        body.addView(btn, dlp);
 
-        // -------- Download --------
-        TextView dl = iconButton("Download", ICON_DOWNLOAD, C_ACCENT, true);
-        dl.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { onDownloadClick(v); }
-        });
-        root.addView(dl, lp(0, 8));
-
-        // -------- Telegram Creator --------
-        TextView tg = iconButton("Telegram Creator", ICON_SEND, C_BTN, false);
-        tg.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { openUrl(LINK_CREATOR); }
-        });
-        root.addView(tg, lp(0, 0));
-
-        // -------- окно панели: на месте кружка --------
-        int pw = dp(280);
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                pw, ViewGroup.LayoutParams.WRAP_CONTENT, overlayType(),
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = bubbleLp.x + (bubbleLp.width - pw) / 2;
-        lp.y = bubbleLp.y;
-
-        // Тащим панель за заголовок (шапку)
-        attachDragToView(title);
-
-        try { wm.addView(root, lp); } catch (Throwable t) {
-            try { bubble.setVisibility(View.VISIBLE); } catch (Throwable ignored) { }
-            return;
-        }
-        panel = root;
-        panelLp = lp;
+        root.addView(body, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
     }
 
     private void closePanel() {
-        if (panel == null || panelLp == null) return;
+        try {
+            WindowManager.LayoutParams lp = panelLp;
+            if (lp != null) {
+                posX = lp.x;
+                posY = lp.y;
+            }
+            removePanelView();
+            showBubble();
+        } catch (Throwable ignored) { }
+    }
 
-        int px = panelLp.x;
-        int py = panelLp.y;
-
-        LinearLayout p = panel;
-        panel = null;
-        panelLp = null;
-        if (p != null && wm != null) {
-            try { wm.removeView(p); } catch (Throwable ignored) { }
-        }
-
-        if (bubble != null && bubbleLp != null && wm != null) {
-            bubbleLp.x = px + (dp(280) - bubbleLp.width) / 2;
-            bubbleLp.y = py;
+    // tap = close panel (bubble returns at the panel's spot); hold 3 s = kill everything
+    private void attachClose(final View close) {
+        close.setOnTouchListener((v, e) -> {
             try {
-                bubble.setVisibility(View.VISIBLE);
-                wm.updateViewLayout(bubble, bubbleLp);
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        holdTriggered = false;
+                        v.setAlpha(0.5f);
+                        ui.removeCallbacks(holdRunnable);
+                        ui.postDelayed(holdRunnable, 3000);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        ui.removeCallbacks(holdRunnable);
+                        v.setAlpha(1f);
+                        if (!holdTriggered && inside(v, e)) closePanel();
+                        return true;
+                    case MotionEvent.ACTION_CANCEL:
+                        ui.removeCallbacks(holdRunnable);
+                        v.setAlpha(1f);
+                        return true;
+                    default:
+                        break;
+                }
             } catch (Throwable ignored) { }
-        }
-    }
-
-    /** Тащим панель за указанную view (обычно — заголовок). */
-    private void attachDragToView(final View handle) {
-        handle.setOnTouchListener(new View.OnTouchListener() {
-            private int sx, sy;
-            private float tx, ty;
-            @Override public boolean onTouch(View v, MotionEvent e) {
-                try {
-                    WindowManager.LayoutParams p = panelLp;
-                    if (p == null || wm == null || panel == null) return false;
-                    switch (e.getActionMasked()) {
-                        case MotionEvent.ACTION_DOWN:
-                            sx = p.x; sy = p.y;
-                            tx = e.getRawX(); ty = e.getRawY();
-                            return true;
-                        case MotionEvent.ACTION_MOVE: {
-                            p.x = (int) (sx + e.getRawX() - tx);
-                            p.y = (int) (sy + e.getRawY() - ty);
-                            wm.updateViewLayout(panel, p);
-                            return true;
-                        }
-                    }
-                } catch (Throwable ignored) { }
-                return false;
-            }
+            return true;
         });
     }
 
-    private void attachCloseHandler(final TextView close) {
-        close.setOnTouchListener(new View.OnTouchListener() {
-            @Override public boolean onTouch(View v, MotionEvent e) {
-                try {
-                    switch (e.getActionMasked()) {
-                        case MotionEvent.ACTION_DOWN:
-                            holdTriggered = false;
-                            close.setTextColor(Color.parseColor("#FF5C5C"));
-                            ui.removeCallbacks(holdRunnable);
-                            ui.postDelayed(holdRunnable, 3000);
-                            return true;
-                        case MotionEvent.ACTION_UP:
-                            ui.removeCallbacks(holdRunnable);
-                            close.setTextColor(Color.parseColor("#9A9A9A"));
-                            if (!holdTriggered) closePanel();
-                            return true;
-                        case MotionEvent.ACTION_CANCEL:
-                            ui.removeCallbacks(holdRunnable);
-                            close.setTextColor(Color.parseColor("#9A9A9A"));
-                            return true;
-                    }
-                } catch (Throwable ignored) { }
-                return true;
-            }
-        });
+    private boolean inside(View v, MotionEvent e) {
+        return e.getX() >= 0 && e.getX() <= v.getWidth()
+                && e.getY() >= 0 && e.getY() <= v.getHeight();
     }
 
-    // ------------------------------------------------------------- teardown
+    // ------------------------------------------------------------ download
 
-    private void destroyAll() {
-        LinearLayout p = panel;
-        panel = null; panelLp = null;
-        if (p != null && wm != null) {
-            try { wm.removeView(p); } catch (Throwable ignored) { }
-        }
-        TextView b = bubble;
-        bubble = null; bubbleLp = null;
-        if (b != null && wm != null) {
-            try { wm.removeView(b); } catch (Throwable ignored) { }
-        }
-    }
-
-    private void killAll() {
-        try { ui.removeCallbacksAndMessages(null); } catch (Throwable ignored) { }
-        destroyAll();
-        try { stopForeground(Service.STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) { }
-        try { stopSelf(); } catch (Throwable ignored) { }
-    }
-
-    // ------------------------------------------------------------- download
-
-    private void onDownloadClick(final View v) {
+    private void onDownload() {
         if (busy) return;
         busy = true;
-
         try {
-            v.animate().alpha(0.4f).setDuration(120).withEndAction(new Runnable() {
-                @Override public void run() { v.animate().alpha(1f).setDuration(180).start(); }
-            }).start();
+            View b = downloadBtn;
+            if (b != null) b.animate().alpha(0.4f).setDuration(120).start();
         } catch (Throwable ignored) { }
 
         final String m = mode;
         try {
-            io.execute(new Runnable() {
-                @Override public void run() {
-                    String res;
-                    try { res = ModInstaller.install(getApplicationContext(), m); }
-                    catch (Throwable t) { res = "ERROR: " + t.getMessage(); }
-                    final String r = (res == null) ? "ERROR: empty result" : res;
-                    ui.post(new Runnable() {
-                        @Override public void run() { finishDownload(r); }
-                    });
+            io.execute(() -> {
+                String res;
+                try {
+                    res = ModInstaller.install(getApplicationContext(), m);
+                } catch (Throwable t) {
+                    res = "ERROR: " + t.getMessage();
                 }
+                final String r = (res == null) ? "ERROR: empty result" : res;
+                ui.post(() -> finishDownload(r));
             });
         } catch (Throwable t) {
-            busy = false;
-            toast("Не удалось запустить установку");
+            finishDownload("ERROR: " + t.getMessage());
         }
     }
 
     private void finishDownload(String r) {
         busy = false;
-        boolean ok = "OK".equals(r);
-        toast(ok ? "Установлено" : r);
+        try {
+            View b = downloadBtn;
+            if (b != null) b.animate().alpha(1f).setDuration(220).start();
+        } catch (Throwable ignored) { }
+        toast("OK".equals(r) ? "Mods installed" : r);
     }
 
-    // ------------------------------------------------------------- icons
+    // ------------------------------------------------------------ helpers
 
-    private static final int ICON_DOWNLOAD = 1;
-    private static final int ICON_SEND     = 2;
-
-    private Drawable iconDrawable(int type, int color) {
-        return new VectorIcon(type, color, dp(18));
-    }
-
-    private static class VectorIcon extends Drawable {
-        private final int type;
-        private final int size;
-        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        VectorIcon(int type, int color, int size) {
-            this.type = type; this.size = size;
-            p.setColor(color); p.setStyle(Paint.Style.STROKE);
-            p.setStrokeWidth(size / 8f);
-            p.setStrokeCap(Paint.Cap.ROUND);
-            p.setStrokeJoin(Paint.Join.ROUND);
-        }
-        @Override public void draw(Canvas c) {
-            float s = size; float cx = s / 2f;
-            if (type == ICON_DOWNLOAD) {
-                c.drawLine(cx, s * 0.18f, cx, s * 0.68f, p);
-                Path arrow = new Path();
-                arrow.moveTo(s * 0.30f, s * 0.50f);
-                arrow.lineTo(cx, s * 0.72f);
-                arrow.lineTo(s * 0.70f, s * 0.50f);
-                c.drawPath(arrow, p);
-                c.drawLine(s * 0.22f, s * 0.86f, s * 0.78f, s * 0.86f, p);
-            } else if (type == ICON_SEND) {
-                Path t = new Path();
-                t.moveTo(s * 0.10f, s * 0.50f);
-                t.lineTo(s * 0.90f, s * 0.15f);
-                t.lineTo(s * 0.60f, s * 0.85f);
-                t.lineTo(s * 0.50f, s * 0.55f);
-                t.lineTo(s * 0.10f, s * 0.50f);
-                t.close();
-                c.drawPath(t, p);
-            }
-        }
-        @Override public void setAlpha(int a) { p.setAlpha(a); }
-        @Override public void setColorFilter(android.graphics.ColorFilter cf) { p.setColorFilter(cf); }
-        @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
-        @Override public int getIntrinsicWidth() { return size; }
-        @Override public int getIntrinsicHeight() { return size; }
-    }
-
-    private TextView iconButton(String label, int iconType, int bgColor, boolean primary) {
-        TextView t = new TextView(this);
-        t.setText(label);
-        t.setTextColor(primary ? Color.WHITE : C_TEXT);
-        t.setTextSize(15);
-        t.setGravity(Gravity.CENTER);
-        t.setPadding(dp(12), dp(12), dp(12), dp(12));
-        t.setBackground(rounded(bgColor, 10, primary ? bgColor : C_BTN_STROKE, 1));
-        Drawable ic = iconDrawable(iconType, primary ? Color.WHITE : C_TEXT);
-        ic.setBounds(0, 0, dp(18), dp(18));
-        t.setCompoundDrawables(ic, null, null, null);
-        t.setCompoundDrawablePadding(dp(8));
-        t.setClickable(true);
-        return t;
+    private String srcName() {
+        return "apk".equals(mode) ? "APK" : "Google Play";
     }
 
     private TextView text(String s, int sp, int color, boolean bold) {
@@ -474,14 +551,6 @@ public class FloatingBubbleService extends Service {
         t.setTextSize(sp);
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         return t;
-    }
-
-    private LinearLayout.LayoutParams lp(int topDp, int bottomDp) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        p.topMargin = dp(topDp);
-        p.bottomMargin = dp(bottomDp);
-        return p;
     }
 
     private GradientDrawable rounded(int color, int radiusDp, int strokeColor, int strokeDp) {
@@ -496,20 +565,11 @@ public class FloatingBubbleService extends Service {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
     }
 
-    private void openUrl(String url) {
-        try {
-            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(i);
-        } catch (Throwable t) { toast("Cannot open link"); }
-    }
-
     private void toast(final String msg) {
-        ui.post(new Runnable() {
-            @Override public void run() {
-                try { Toast.makeText(getApplicationContext(), msg, Toast.LENGTH_LONG).show(); }
-                catch (Throwable ignored) { }
-            }
+        ui.post(() -> {
+            try {
+                Toast.makeText(getApplicationContext(), msg, Toast.LENGTH_LONG).show();
+            } catch (Throwable ignored) { }
         });
     }
 }

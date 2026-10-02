@@ -1,0 +1,11 @@
+{
+  "appId": "com.venceti.mods",
+  "appName": "Venceti Mods",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}

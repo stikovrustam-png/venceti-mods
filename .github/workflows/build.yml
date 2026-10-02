@@ -1,0 +1,61 @@
+name: Build Venceti Mods APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install npm deps
+        run: npm install
+
+      - name: Add Capacitor Android platform
+        run: npx cap add android
+
+      - name: Inject custom Java sources
+        run: |
+          mkdir -p android/app/src/main/java/com/venceti/mods
+          cp android-src/MainActivity.java android/app/src/main/java/com/venceti/mods/
+          cp android-src/FloatingBubbleService.java android/app/src/main/java/com/venceti/mods/
+          cp android-src/ModInstaller.java android/app/src/main/java/com/venceti/mods/
+
+      - name: Inject AndroidManifest
+        run: cp android-src/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+
+      - name: Add Shizuku dependency to build.gradle
+        run: |
+          GRADLE=android/app/build.gradle
+          if ! grep -q "dev.rikka.shizuku" "$GRADLE"; then
+            sed -i '/dependencies {/a\    implementation "dev.rikka.shizuku:api:13.1.5"\n    implementation "dev.rikka.shizuku:provider:13.1.5"' "$GRADLE"
+          fi
+
+      - name: Sync web
+        run: npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VencetiMods-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk

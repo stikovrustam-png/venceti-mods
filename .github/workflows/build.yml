@@ -36,14 +36,27 @@ jobs:
       - name: Inject AndroidManifest
         run: cp android-src/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
-      - name: Add Shizuku dependency and fix minSdk
+      - name: Force minSdk 23 everywhere
+        run: |
+          echo "===== variables.gradle BEFORE ====="
+          cat android/variables.gradle || true
+          echo "===== build.gradle BEFORE (minSdk lines) ====="
+          grep -n "minSdk" android/app/build.gradle || true
+
+          sed -i 's/minSdkVersion *= *22/minSdkVersion = 23/' android/variables.gradle || true
+          sed -i 's/minSdkVersion *22/minSdkVersion 23/' android/app/build.gradle || true
+
+          echo "===== variables.gradle AFTER ====="
+          cat android/variables.gradle || true
+          echo "===== build.gradle AFTER (minSdk lines) ====="
+          grep -n "minSdk" android/app/build.gradle || true
+
+      - name: Add Shizuku dependency
         run: |
           GRADLE=android/app/build.gradle
           if ! grep -q "dev.rikka.shizuku" "$GRADLE"; then
             sed -i '/dependencies {/a\    implementation "dev.rikka.shizuku:api:13.1.5"\n    implementation "dev.rikka.shizuku:provider:13.1.5"' "$GRADLE"
           fi
-          sed -i 's/minSdkVersion 22/minSdkVersion 23/' "$GRADLE"
-          sed -i 's/minSdkVersion rootProject.ext.minSdkVersion/minSdkVersion 23/' "$GRADLE"
 
       - name: Sync web
         run: npx cap sync android

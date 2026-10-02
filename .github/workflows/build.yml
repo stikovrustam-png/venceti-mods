@@ -28,35 +28,70 @@ jobs:
 
       - name: Inject custom Java sources
         run: |
-          mkdir -p android/app/src/main/java/com/venceti/mods
-          cp android-src/MainActivity.java android/app/src/main/java/com/venceti/mods/
-          cp android-src/FloatingBubbleService.java android/app/src/main/java/com/venceti/mods/
-          cp android-src/ModInstaller.java android/app/src/main/java/com/venceti/mods/
+          D=android/app/src/main/java/com/venceti/mods
+          mkdir -p $D
+          cp android-src/MainActivity.java $D/
+          cp android-src/FloatingBubbleService.java $D/
+          cp android-src/ModInstaller.java $D/
 
-      - name: Inject AndroidManifest
-        run: cp android-src/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-
-      - name: Force minSdk 23 everywhere
+      - name: Patch ModInstaller (Shizuku.newProcess is private)
         run: |
-          echo "===== variables.gradle BEFORE ====="
-          cat android/variables.gradle || true
-          echo "===== build.gradle BEFORE (minSdk lines) ====="
-          grep -n "minSdk" android/app/build.gradle || true
+          python3 - <<'PY'
+          p='android/app/src/main/java/com/venceti/mods/ModInstaller.java'
+          s=open(p,encoding='utf-8').read()
+          old='Process p = Shizuku.newProcess(new String[]{"sh", "-c", cmd}, null, null);'
+          new=('java.lang.reflect.Method m = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);\n'
+               '            m.setAccessible(true);\n'
+               '            Process p = (Process) m.invoke(null, new String[]{"sh", "-c", cmd}, null, null);')
+          if old in s:
+              s=s.replace(old,new)
+              open(p,'w',encoding='utf-8').write(s)
+              print("patched")
+          else:
+              print("pattern not found")
+          PY
 
-          sed -i 's/minSdkVersion *= *22/minSdkVersion = 23/' android/variables.gradle || true
-          sed -i 's/minSdkVersion *22/minSdkVersion 23/' android/app/build.gradle || true
+      - name: Patch AndroidManifest (keep Capacitor's, add ours)
+        run: |
+          python3 - <<'PY'
+          p='android/app/src/main/AndroidManifest.xml'
+          s=open(p,encoding='utf-8').read()
+          perms=["INTERNET","SYSTEM_ALERT_WINDOW","FOREGROUND_SERVICE","FOREGROUND_SERVICE_SPECIAL_USE","POST_NOTIFICATIONS","MANAGE_EXTERNAL_STORAGE"]
+          add=''
+          for x in perms:
+              if 'android.permission.'+x+'"' not in s:
+                  add+='    <uses-permission android:name="android.permission.'+x+'"/>\n'
+          s=s.replace('<application',add+'    <application',1)
+          extra='''
+              <service android:name=".FloatingBubbleService" android:exported="false"
+                  android:foregroundServiceType="specialUse">
+                  <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                      android:value="Floating mods installer overlay"/>
+              </service>
+              <provider android:name="rikka.shizuku.ShizukuProvider"
+                  android:authorities="${applicationId}.shizuku"
+                  android:multiprocess="false"
+                  android:enabled="true"
+                  android:exported="true"
+                  android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+          '''
+          s=s.replace('</application>',extra+'</application>',1)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+          cat android/app/src/main/AndroidManifest.xml
 
-          echo "===== variables.gradle AFTER ====="
-          cat android/variables.gradle || true
-          echo "===== build.gradle AFTER (minSdk lines) ====="
-          grep -n "minSdk" android/app/build.gradle || true
+      - name: Force minSdk 23
+        run: |
+          sed -i -E 's/minSdkVersion *= *[0-9]+/minSdkVersion = 23/' android/variables.gradle
+          grep -n minSdk android/variables.gradle
 
       - name: Add Shizuku dependency
         run: |
           GRADLE=android/app/build.gradle
           if ! grep -q "dev.rikka.shizuku" "$GRADLE"; then
-            sed -i '/dependencies {/a\    implementation "dev.rikka.shizuku:api:13.1.5"\n    implementation "dev.rikka.shizuku:provider:13.1.5"' "$GRADLE"
+            sed -i '0,/^dependencies {/s//dependencies {\n    implementation "dev.rikka.shizuku:api:13.1.5"\n    implementation "dev.rikka.shizuku:provider:13.1.5"/' "$GRADLE"
           fi
+          grep -n -B1 -A3 "rikka" "$GRADLE"
 
       - name: Sync web
         run: npx cap sync android
@@ -65,7 +100,24 @@ jobs:
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          STATUS=0
+          ./gradlew assembleDebug --stacktrace --no-daemon > ../build.log 2>&1 || STATUS=$?
+          cd ..
+          {
+            echo '## Gradle errors'
+            echo '```'
+            grep -n -E -A6 "What went wrong|error:|Could not (find|resolve)|cannot be smaller|Execution failed" build.log | head -80
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          grep -n -E -A6 "What went wrong|error:" build.log | head -60 || true
+          exit $STATUS
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
